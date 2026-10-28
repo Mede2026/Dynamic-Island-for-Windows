@@ -11074,10 +11074,28 @@ void SeekMediaToTicks(int64_t targetTicks) {
                 if (!session) session = manager.GetCurrentSession();
 
                 if (session) {
-                    session.TryChangePlaybackPositionAsync(targetTicks).get();
+                    // Only failures are logged: a drag sends a seek every 150ms.
+                    const bool accepted = session.TryChangePlaybackPositionAsync(targetTicks).get();
+                    if (!accepted) {
+                        bool positionEnabled = false;
+                        try {
+                            positionEnabled = session.GetPlaybackInfo().Controls().IsPlaybackPositionEnabled();
+                        } catch (...) {
+                        }
+                        Wh_Log(L"Seek to %lld refused by %s (wanted %s, position control %s).",
+                               static_cast<long long>(targetTicks),
+                               session.SourceAppUserModelId().c_str(), currentAumid.c_str(),
+                               positionEnabled ? L"enabled" : L"disabled");
+                    }
+                } else {
+                    Wh_Log(L"Seek: no media session found (wanted %s).", currentAumid.c_str());
                 }
             }
-        } catch (...) {}
+        } catch (winrt::hresult_error const& e) {
+            Wh_Log(L"Seek failed: 0x%08X %s", static_cast<unsigned>(e.code()), e.message().c_str());
+        } catch (...) {
+            Wh_Log(L"Seek failed with an unknown exception.");
+        }
     }).detach();
 }
 
@@ -11123,10 +11141,12 @@ void SendMediaTransportCommand(int cmd) {
 
         bool sessionAttempted = false;
         bool reportedSuccess = false;
+        std::wstring sessionAumid;
         try {
             auto session = ResolveMediaSession();
             if (session) {
                 sessionAttempted = true;
+                sessionAumid = session.SourceAppUserModelId().c_str();
                 if (cmd == 0) {
                     reportedSuccess = session.TrySkipPreviousAsync().get();
                 } else if (cmd == 1) {
@@ -11134,18 +11154,25 @@ void SendMediaTransportCommand(int cmd) {
                 } else if (cmd == 2) {
                     reportedSuccess = session.TrySkipNextAsync().get();
                 }
+            } else {
+                Wh_Log(L"Media transport command %d: no media session found.", cmd);
             }
+        } catch (winrt::hresult_error const& e) {
+            Wh_Log(L"Media transport command %d to %s failed: 0x%08X %s", cmd,
+                   sessionAumid.c_str(), static_cast<unsigned>(e.code()), e.message().c_str());
+            sessionAttempted = false;
         } catch (...) {
+            Wh_Log(L"Media transport command %d to %s failed with an unknown exception.", cmd,
+                   sessionAumid.c_str());
             sessionAttempted = false;
         }
 
         if (sessionAttempted) {
-            if (!reportedSuccess) {
-                // Not escalated to a media key on purpose (see above). Logged so
-                // a player that genuinely refuses transport control is
-                // diagnosable from the mod log.
-                Wh_Log(L"Media transport command %d was refused by the session.", cmd);
-            }
+            // Names the session actually driven, so a command that reaches the
+            // wrong player is diagnosable from the mod log.
+            Wh_Log(L"Media transport command %d sent to %s: %s.", cmd, sessionAumid.c_str(),
+                   reportedSuccess ? L"accepted" : L"refused");
+            // A refusal is not escalated to a media key on purpose (see above).
             return;
         }
 
@@ -22881,6 +22908,8 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                         std::lock_guard lock(g_stateMutex);
                         g_state.media.positionTicks = targetTicks;
                         g_state.media.lastUpdatedTicks = GetTickCount64();
+                    } else {
+                        Wh_Log(L"Seek ignored: the media session reports no track duration.");
                     }
                     g_layoutDirty = true;
                     return 0;
